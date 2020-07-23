@@ -58,7 +58,7 @@ func (fs *DriveFS) Init() {
 		},
 		Children: make(map[string]*File),
 	}
-	req, err := http.NewRequest("GET", driveAPI, nil)
+	req, err := http.NewRequest("GET", driveAPI + "/api/files", nil)
 	if err == nil {
 		req.Header.Add("Authorization", token)
 	}
