@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/billziss-gh/cgofuse/fuse"
 )
@@ -27,6 +28,7 @@ type File struct {
 	UpdatedAt uint64 `json:"updatedAt"`
 	stat fuse.Stat_t
 	data []byte
+	parentFile *File
 	Children  map[string]*File
 }
 
@@ -39,22 +41,24 @@ type DriveFS struct {
 
 func (fs *DriveFS) Init() {
 	tmsp := fuse.Now()
+	uid, gid, _ := fuse.Getcontext()
 	fs.pathFileMap["/"] = &File{
 		stat: fuse.Stat_t{
 			Dev:      0,
 			Ino:      1,
 			Mode:     fuse.S_IFDIR|00777,
 			Nlink:    1,
-			Uid:      0,
-			Gid:      0,
+			Uid:      uid,
+			Gid:      gid,
 			Atim:     tmsp,
 			Mtim:     tmsp,
 			Ctim:     tmsp,
 			Birthtim: tmsp,
 			Flags:    0,
 		},
+		Children: make(map[string]*File),
 	}
-	req, err := http.NewRequest("GET", "http://noga.northeurope.cloudapp.azure.com/api/files", nil)
+	req, err := http.NewRequest("GET", driveAPI, nil)
 	if err == nil {
 		req.Header.Add("Authorization", token)
 	}
@@ -76,19 +80,17 @@ func (fs *DriveFS) Init() {
 
 	for i := 0; i < len(files); i++ {
 		if files[i].Type == folderContentType {
-			code := fs.Mkdir("\\" + files[i].Name, fuse.S_IFDIR|07777)
+			code := fs.Mkdir("/" + files[i].Name, fuse.S_IFDIR)
 			if code != 0 {
 				return
 			}
 
 		} else {
-			code := fs.Mknod("\\" + files[i].Name, fuse.S_IFREG, 0)
+			code := fs.Mknod("/" + files[i].Name, fuse.S_IFREG, 0)
 			if code != 0 {
 				return
 			}
 		}
-
-		fs.pathFileMap["/" + files[i].Name] = &files[i]
 	}
 }
 
@@ -96,22 +98,73 @@ func (fs *DriveFS) Destroy() {
 
 }
 
-func (fs *DriveFS) Statsfs(path string, stat *fuse.Statfs_t) int {
+func (fs *DriveFS) Statfs(path string, stat *fuse.Statfs_t) int {
 	stat.Bsize = 4096
 	stat.Frsize = 4096
 	stat.Blocks = 2097152
 	stat.Bfree = 2097152
-
+	
 	return 0
 }
 
 func (fs *DriveFS) Mknod(path string, mode uint32, dev uint64) int {
-	
+	tmsp := fuse.Now()
+	uid, gid, _ := fuse.Getcontext()
+	dir := filepath.ToSlash(filepath.Dir(path))
+	parent := fs.pathFileMap[dir]
+	name := filepath.Base(path)
+
+	fs.pathFileMap[path] = &File{
+		Name: name,
+		parentFile: parent,
+		stat: fuse.Stat_t{
+			Dev:      dev,
+			Ino:      uint64(len(fs.pathFileMap) + 1),
+			Mode:     mode,
+			Nlink:    1,
+			Uid:      uid,
+			Gid:      gid,
+			Atim:     tmsp,
+			Mtim:     tmsp,
+			Ctim:     tmsp,
+			Birthtim: tmsp,
+			Flags:    0,
+		},
+		Children: make(map[string]*File),
+	}
+
+	parent.Children[name] = fs.pathFileMap[path]
+
 	return 0
 }
 
 func (fs *DriveFS) Mkdir(path string, mode uint32) int {
-	
+	tmsp := fuse.Now()
+	uid, gid, _ := fuse.Getcontext()
+	dir := filepath.ToSlash(filepath.Dir(path))
+	parent := fs.pathFileMap[dir]
+	name := filepath.Base(path)
+
+	fs.pathFileMap[path] = &File{
+		Name: name,
+		parentFile: parent,
+		stat: fuse.Stat_t{
+			Dev:      0,
+			Ino:      uint64(len(fs.pathFileMap) + 1),
+			Mode:     fuse.S_IFDIR|(mode&07777),
+			Nlink:    1,
+			Uid:      uid,
+			Gid:      gid,
+			Atim:     tmsp,
+			Mtim:     tmsp,
+			Ctim:     tmsp,
+			Birthtim: tmsp,
+			Flags:    0,
+		},
+		Children: make(map[string]*File),
+	}
+
+	parent.Children[name] = fs.pathFileMap[path]
 	
 	return 0
 }
@@ -158,6 +211,7 @@ func (fs *DriveFS) Open(path string, flags int) (errc int, fh uint64) {
 
 func (fs *DriveFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) (errc int) {
 	*stat = fs.pathFileMap[path].stat
+
 	return 0
 }
 
@@ -178,13 +232,21 @@ func (fs *DriveFS) Release(path string, fh uint64) (errc int) {
 }
 
 func (fs *DriveFS) Opendir(path string) (errc int, fh uint64) {
-	return 0, uint64(0)
+	return 0, fs.pathFileMap[path].stat.Ino
 }
 
 func (fs *DriveFS) Readdir(path string,
 	fill func(name string, stat *fuse.Stat_t, ofst int64) bool,
 	ofst int64,
 	fh uint64) (errc int) {
+		node := fs.pathFileMap[path]
+		fill(".", &node.stat, 0)
+		fill("..", nil, 0)
+		for _, chld := range node.Children {
+			if !fill(chld.Name, &chld.stat, 0) {
+				break
+			}
+		}
 	return 0
 }
 
