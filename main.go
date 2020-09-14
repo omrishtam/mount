@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
+	"mime"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
 	"path/filepath"
 
@@ -30,6 +35,18 @@ type File struct {
 type DriveFS struct {
 	fuse.FileSystemBase
 	pathFileMap map[string]*File
+}
+
+func updateFile(fileStats *File, file *fileAPI.GetFileByIDResponse) {
+	if file == nil || fileStats == nil {
+		return
+	}
+
+	fileStats.File = *file
+	fileStats.stat.Birthtim = fuse.Timespec{Sec: file.CreatedAt / 1000, Nsec: file.CreatedAt % 1000}
+	fileStats.stat.Ctim = fuse.Timespec{Sec: file.UpdatedAt / 1000, Nsec: file.UpdatedAt % 1000}
+	fileStats.stat.Mtim = fuse.Timespec{Sec: file.UpdatedAt / 1000, Nsec: file.UpdatedAt % 1000}
+	fileStats.stat.Size = file.Size
 }
 
 func (fs *DriveFS) newNode(path string, mode uint32, dev uint64, file *fileAPI.GetFileByIDResponse) {
@@ -61,13 +78,7 @@ func (fs *DriveFS) newNode(path string, mode uint32, dev uint64, file *fileAPI.G
 		},
 	}
 
-	if file != nil {
-		fileStats.File = *file
-		fileStats.stat.Birthtim = fuse.Timespec{Sec: file.CreatedAt / 1000, Nsec: file.CreatedAt % 1000}
-		fileStats.stat.Ctim = fuse.Timespec{Sec: file.UpdatedAt / 1000, Nsec: file.UpdatedAt % 1000}
-		fileStats.stat.Mtim = fuse.Timespec{Sec: file.UpdatedAt / 1000, Nsec: file.UpdatedAt % 1000}
-		fileStats.stat.Size = file.Size
-	}
+	updateFile(fileStats, file)
 
 	if parent != nil {
 		parent.Children[name] = fileStats
@@ -259,6 +270,64 @@ func (fs *DriveFS) Read(path string, buff []byte, ofst int64, fh uint64) (n int)
 }
 
 func (fs *DriveFS) Write(path string, buff []byte, ofst int64, fh uint64) (n int) {
+	body := &bytes.Buffer{}
+
+	writer := multipart.NewWriter(body)
+	
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition",
+		fmt.Sprintf(`form-data; name="%s"; filename="%s"`,
+			escapeQuotes("file"), escapeQuotes(filepath.Base(path))))
+	h.Set("Content-Type", mime.TypeByExtension(filepath.Ext(path)))
+	part, _ := writer.CreatePart(h)
+	
+	part.Write(buff)
+	writer.Close()
+
+	req, err := http.NewRequest("POST", driveAPI+"/api/upload?uploadType=multipart", body)
+	req.Header.Add("Content-Type", writer.FormDataContentType())
+	req.Header.Add("Authorization", token)
+	if err != nil {
+		return
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer res.Body.Close()
+
+	fileIDBytes, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return
+	}
+
+	fileID := string(fileIDBytes)
+	req, err = http.NewRequest("GET", driveAPI+"/api/files/"+fileID, nil)
+	if err == nil {
+		req.Header.Add("Authorization", token)
+	}
+
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer res.Body.Close()
+
+	var file fileAPI.GetFileByIDResponse
+	respBytes, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return
+	}
+
+	if err = json.Unmarshal(respBytes, &file); err != nil {
+		return
+	}
+
+	updateFile(fs.pathFileMap[path], &file)
+
+	n = copy(fs.pathFileMap[path].data, buff)
+
 	return
 }
 
